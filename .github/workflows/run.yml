@@ -69,6 +69,7 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
           AGENT_PROMPT: ${{ inputs.prompt }}
         run: |
           set -euo pipefail
