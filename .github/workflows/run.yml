@@ -68,7 +68,7 @@ jobs:
       - name: Run OpenHands Agent
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
           AGENT_PROMPT: ${{ inputs.prompt }}
         run: |
           set -euo pipefail
