@@ -39,6 +39,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+import sqlite3
+
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -87,6 +89,60 @@ class Job:
             "updated_at": self.updated_at.isoformat(),
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> 'Job':
+        return cls(
+            job_id=data["job_id"],
+            upstream_repo=data["upstream_repo"],
+            prompt=data["prompt"],
+            callback_url=data.get("callback_url"),
+            status=JobStatus(data["status"]),
+            fork_repo=data.get("fork_repo"),
+            branch=data.get("branch"),
+            pr_url=data.get("pr_url"),
+            workflow_run_id=data.get("workflow_run_id"),
+            error=data.get("error"),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            updated_at=datetime.fromisoformat(data["updated_at"]),
+        )
+
+
+
+class JobStorage:
+    """SQLite storage for jobs."""
+    def __init__(self, db_path: str = "jobs.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+    def save_job(self, job: Job):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO jobs (job_id, data, updated_at) VALUES (?, ?, ?)",
+                (job.job_id, json.dumps(job.to_dict()), job.updated_at.isoformat())
+            )
+
+    def get_job(self, job_id: str) -> Optional[Job]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,))
+            row = cursor.fetchone()
+            if row:
+                return Job.from_dict(json.loads(row[0]))
+        return None
+
+    def list_jobs(self, limit: int = 100) -> list[Job]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT data FROM jobs ORDER BY updated_at DESC LIMIT ?", (limit,))
+            return [Job.from_dict(json.loads(row[0])) for row in cursor.fetchall()]
 
 class AgentRunner:
     """
@@ -130,9 +186,8 @@ class AgentRunner:
         self.fork_timeout = fork_timeout
         self.fork_poll_interval = fork_poll_interval
         
-        # In-memory job storage
-        # WARNING: Jobs are lost on restart. Use a database in production!
-        self._jobs: dict[str, Job] = {}
+        # Persistent job storage
+        self._storage = JobStorage()
         
         # Reusable HTTP client
         self._client: Optional[httpx.AsyncClient] = None
@@ -148,6 +203,41 @@ class AgentRunner:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=30.0)
         return self._client
+
+    async def _request_with_retry(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Perform HTTP request with retry logic."""
+        client = await self._get_client()
+        max_retries = 3
+        base_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                response = await client.request(method, url, **kwargs)
+                
+                # Handle rate limiting
+                if response.status_code == 403 and "rate limit" in response.text.lower():
+                    reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+                    sleep_duration = max(reset_time - time.time(), 0) + 1
+                    logger.warning(f"Rate limit hit, sleeping for {sleep_duration}s")
+                    await asyncio.sleep(min(sleep_duration, 60)) # Cap sleep at 60s
+                    continue
+
+                # Retry on server errors
+                if response.status_code >= 500:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Server error {response.status_code}, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+
+                return response
+            except (httpx.RequestError, asyncio.TimeoutError) as e:
+                delay = base_delay * (2 ** attempt)
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Request error {e}, retrying in {delay}s...")
+                await asyncio.sleep(delay)
+        
+        return await client.request(method, url, **kwargs) # Final attempt
     
     async def close(self) -> None:
         """Close HTTP client. Call this when shutting down."""
@@ -215,23 +305,26 @@ class AgentRunner:
             prompt=prompt,
             callback_url=callback_url,
         )
-        self._jobs[job_id] = job
+        self._storage.save_job(job)
         
         try:
             # Step 1: Create or get fork
             job.status = JobStatus.FORKING
             job.updated_at = datetime.now(timezone.utc)
+            self._storage.save_job(job)
             
             fork_repo = await self._create_or_get_fork(upstream_repo)
             job.fork_repo = fork_repo
             job.branch = f"bot/{job_id}"
             job.status = JobStatus.FORK_READY
             job.updated_at = datetime.now(timezone.utc)
+            self._storage.save_job(job)
             
             # Step 2: Trigger workflow
             await self._trigger_workflow(job)
             job.status = JobStatus.TRIGGERED
             job.updated_at = datetime.now(timezone.utc)
+            self._storage.save_job(job)
             
             return job
             
@@ -239,6 +332,7 @@ class AgentRunner:
             job.status = JobStatus.FAILED
             job.error = str(e)
             job.updated_at = datetime.now(timezone.utc)
+            self._storage.save_job(job)
             raise
     
     async def _create_or_get_fork(self, upstream_repo: str) -> str:
@@ -260,7 +354,8 @@ class AgentRunner:
         fork_repo = f"{self.bot_username}/{repo_name}"
         
         # Check if fork already exists
-        response = await client.get(
+        response = await self._request_with_retry(
+            "GET",
             f"{self.GITHUB_API}/repos/{fork_repo}",
             headers=self._headers,
         )
@@ -282,7 +377,8 @@ class AgentRunner:
         
         # Create new fork
         logger.info(f"Creating fork of {upstream_repo}...")
-        response = await client.post(
+        response = await self._request_with_retry(
+            "POST",
             f"{self.GITHUB_API}/repos/{upstream_repo}/forks",
             headers=self._headers,
             json={"default_branch_only": True},
@@ -298,18 +394,19 @@ class AgentRunner:
     
     async def _wait_for_fork(self, fork_repo: str) -> None:
         """Wait for a fork to be ready (cloneable)."""
-        client = await self._get_client()
         start_time = time.time()
         
         while time.time() - start_time < self.fork_timeout:
-            response = await client.get(
+            response = await self._request_with_retry(
+                "GET",
                 f"{self.GITHUB_API}/repos/{fork_repo}",
                 headers=self._headers,
             )
             
             if response.status_code == 200:
                 # Try to verify the repo is actually ready by checking branches
-                branches_response = await client.get(
+                branches_response = await self._request_with_retry(
+                    "GET",
                     f"{self.GITHUB_API}/repos/{fork_repo}/branches",
                     headers=self._headers,
                 )
@@ -324,10 +421,9 @@ class AgentRunner:
     
     async def _sync_fork(self, fork_repo: str, upstream_repo: str) -> None:
         """Sync fork with upstream (fetch latest changes)."""
-        client = await self._get_client()
-        
         # Get upstream default branch
-        response = await client.get(
+        response = await self._request_with_retry(
+            "GET",
             f"{self.GITHUB_API}/repos/{upstream_repo}",
             headers=self._headers,
         )
@@ -338,7 +434,8 @@ class AgentRunner:
         default_branch = response.json().get("default_branch", "main")
         
         # Sync fork using GitHub's merge-upstream API
-        response = await client.post(
+        response = await self._request_with_retry(
+            "POST",
             f"{self.GITHUB_API}/repos/{fork_repo}/merge-upstream",
             headers=self._headers,
             json={"branch": default_branch},
@@ -353,9 +450,8 @@ class AgentRunner:
     
     async def _trigger_workflow(self, job: Job) -> None:
         """Trigger the Agent-Runner workflow."""
-        client = await self._get_client()
-        
-        response = await client.post(
+        response = await self._request_with_retry(
+            "POST",
             f"{self.GITHUB_API}/repos/{self.runner_repo}/actions/workflows/run.yml/dispatches",
             headers=self._headers,
             json={
@@ -377,8 +473,13 @@ class AgentRunner:
     
     def get_job(self, job_id: str) -> Optional[Job]:
         """Get job by ID."""
-        return self._jobs.get(job_id)
+        return self._storage.get_job(job_id)
     
+
+    def list_jobs(self, limit: int = 100) -> list[Job]:
+        """List recent jobs."""
+        return self._storage.list_jobs(limit)
+
     def update_job_from_callback(self, job_id: str, status: str, pr_url: Optional[str] = None, error: Optional[str] = None) -> Optional[Job]:
         """
         Update job status from workflow callback.
@@ -392,7 +493,7 @@ class AgentRunner:
         Returns:
             Updated job or None if not found
         """
-        job = self._jobs.get(job_id)
+        job = self._storage.get_job(job_id)
         if not job:
             return None
         
@@ -404,6 +505,7 @@ class AgentRunner:
             job.error = error
         
         job.updated_at = datetime.now(timezone.utc)
+        self._storage.save_job(job)
         return job
     
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
@@ -536,6 +638,12 @@ def create_fastapi_app():
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job.to_dict()
+
+    @app.get("/api/jobs")
+    async def list_jobs(limit: int = 100):
+        """List recent jobs."""
+        jobs = runner.list_jobs(limit)
+        return [job.to_dict() for job in jobs]
     
     @app.post("/webhook/agent-runner")
     async def workflow_callback(request: Request):
