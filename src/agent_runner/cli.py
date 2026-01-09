@@ -77,7 +77,10 @@ async def cmd_run_agent(args: argparse.Namespace) -> int:
         from openhands.tools.task_tracker import TaskTrackerTool
         from openhands.tools.terminal import TerminalTool
     except ImportError:
-        logger.error("OpenHands SDK not installed. Run: uv pip install openhands-sdk openhands-tools")
+        logger.error(
+            "OpenHands SDK not installed (requires Python 3.12+). "
+            "Run: pip install -e '.[openhands]'"
+        )
         return 1
     
     prompt = args.prompt or os.environ.get("AGENT_PROMPT")
