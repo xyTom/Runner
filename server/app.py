@@ -36,7 +36,7 @@ def create_app():
         ALLOW_INSECURE_WEBHOOKS: Set to "1" to allow unsigned webhooks
     """
     try:
-        from fastapi import FastAPI, HTTPException, Request
+        from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
         from pydantic import BaseModel
     except ImportError:
         logger.error("FastAPI not installed. Run: pip install 'agent-runner[server]'")
@@ -109,7 +109,7 @@ def create_app():
         }
     
     @app.post("/api/jobs")
-    async def submit_job(request: SubmitJobRequest):
+    async def submit_job(request: SubmitJobRequest, background_tasks: BackgroundTasks):
         """
         Submit a new agent runner job.
         
@@ -125,6 +125,10 @@ def create_app():
                 callback_url=request.callback_url,
             )
             logger.info(f"Job submitted: job_id={job.job_id}, upstream={job.upstream_repo}")
+            
+            # Start background polling as a fallback
+            background_tasks.add_task(runner.poll_workflow_status, job.job_id)
+            
             return job.to_dict()
         except HTTPException:
             raise
@@ -135,6 +139,12 @@ def create_app():
             logger.exception("Unexpected error while submitting job")
             raise HTTPException(status_code=500, detail="Internal server error")
     
+    @app.get("/api/jobs")
+    async def list_jobs(limit: int = 100):
+        """List recent jobs."""
+        jobs = runner.storage.list_jobs(limit=limit)
+        return [job.to_dict() for job in jobs]
+
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str):
         """Get job status."""
