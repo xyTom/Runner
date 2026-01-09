@@ -19,6 +19,7 @@ from agent_runner.github.pr import PRManager
 from agent_runner.github.repo import RepoManager
 from agent_runner.github.workflow import WorkflowManager
 from agent_runner.models import Job, JobStatus
+from agent_runner.storage import JobStorage
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class AgentRunner:
         allow_insecure_webhooks: bool = False,
         fork_timeout: int = 120,
         fork_poll_interval: int = 5,
+        db_path: str = "jobs.db",
     ):
         """
         Initialize the Agent Runner service.
@@ -68,6 +70,7 @@ class AgentRunner:
             allow_insecure_webhooks: If True, accept unsigned webhook callbacks
             fork_timeout: Maximum seconds to wait for fork to be ready
             fork_poll_interval: Seconds between fork status checks
+            db_path: Path to SQLite database for job storage
         """
         self.runner_repo = runner_repo
         self.bot_username = bot_username
@@ -90,9 +93,8 @@ class AgentRunner:
             allow_insecure=allow_insecure_webhooks,
         )
         
-        # In-memory job storage
-        # WARNING: Jobs are lost on restart. Use a database in production!
-        self._jobs: dict[str, Job] = {}
+        # Persistent job storage
+        self.storage = JobStorage(db_path)
     
     async def close(self) -> None:
         """Close HTTP client. Call this when shutting down."""
@@ -162,30 +164,34 @@ class AgentRunner:
             prompt=prompt,
             callback_url=callback_url,
         )
-        self._jobs[job_id] = job
+        self.storage.save_job(job)
         
         try:
             # Step 1: Create or get fork
             job.update_status(JobStatus.FORKING)
+            self.storage.save_job(job)
             
             fork_repo = await self.repo_manager.create_or_get_fork(upstream_repo)
             job.fork_repo = fork_repo
             job.branch = f"bot/{job_id}"
             job.update_status(JobStatus.FORK_READY)
+            self.storage.save_job(job)
             
             # Step 2: Trigger workflow
             await self.workflow_manager.trigger_workflow(job)
             job.update_status(JobStatus.TRIGGERED)
+            self.storage.save_job(job)
             
             return job
             
         except Exception as e:
             job.mark_failed(str(e))
+            self.storage.save_job(job)
             raise
     
     def get_job(self, job_id: str) -> Optional[Job]:
         """Get job by ID."""
-        return self._jobs.get(job_id)
+        return self.storage.get_job(job_id)
     
     def update_job_from_callback(
         self,
@@ -206,7 +212,7 @@ class AgentRunner:
         Returns:
             Updated job or None if not found
         """
-        job = self._jobs.get(job_id)
+        job = self.storage.get_job(job_id)
         if not job:
             return None
         
@@ -215,8 +221,46 @@ class AgentRunner:
         elif status == "failed":
             job.mark_failed(error or "Unknown error")
         
+        self.storage.save_job(job)
         return job
     
+    async def poll_workflow_status(self, job_id: str, interval: int = 30, timeout: int = 3600):
+        """
+        Poll for workflow completion if callback is not received.
+        
+        This is a fallback mechanism.
+        """
+        job = self.storage.get_job(job_id)
+        if not job or not job.workflow_run_id:
+            return
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            job = self.storage.get_job(job_id)
+            if not job or job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                break
+            
+            status = await self.workflow_manager.get_workflow_run_status(job.workflow_run_id)
+            if status == "completed":
+                conclusion = await self.workflow_manager.get_workflow_run_conclusion(job.workflow_run_id)
+                if conclusion == "success":
+                    # We still need the PR URL, which is usually sent via callback.
+                    # If we don't have it, we might need to find it.
+                    pr_url = None
+                    if not job.pr_url:
+                        try:
+                            fork_owner = job.fork_repo.split("/")[0]
+                            head = f"{fork_owner}:{job.branch}"
+                            pr_url = await self.pr_manager.find_existing_pr(job.upstream_repo, head)
+                        except Exception:
+                            pass
+                    self.update_job_from_callback(job_id, "completed", pr_url=pr_url)
+                else:
+                    self.update_job_from_callback(job_id, "failed", error=f"Workflow finished with conclusion: {conclusion}")
+                break
+            
+            await asyncio.sleep(interval)
+
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """
         Verify webhook signature using HMAC-SHA256.

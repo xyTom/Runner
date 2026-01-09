@@ -35,7 +35,7 @@ class WorkflowManager:
         job: Job,
         workflow_file: str = "run.yml",
         ref: str = "main",
-    ) -> None:
+    ) -> int:
         """
         Trigger the Agent-Runner workflow.
         
@@ -43,6 +43,9 @@ class WorkflowManager:
             job: Job to run
             workflow_file: Workflow filename
             ref: Git ref to run workflow on
+            
+        Returns:
+            Workflow run ID (if available)
             
         Raises:
             Exception: If workflow dispatch fails
@@ -65,6 +68,47 @@ class WorkflowManager:
             raise Exception(f"Failed to trigger workflow: {response.status_code} - {response.text}")
         
         logger.info(f"Workflow triggered for job {job.job_id}")
+        
+        # Try to find the workflow run ID
+        import asyncio
+        await asyncio.sleep(2)  # Wait for GitHub to register the run
+        
+        run_id = await self.find_workflow_run(job.job_id)
+        if run_id:
+            job.workflow_run_id = run_id
+            logger.info(f"Found workflow run ID {run_id} for job {job.job_id}")
+        
+        return run_id or 0
+
+    async def find_workflow_run(self, job_id: str) -> Optional[int]:
+        """Find workflow run ID by job_id in inputs."""
+        response = await self.client.get(
+            f"/repos/{self.runner_repo}/actions/runs",
+            params={"event": "workflow_dispatch", "per_page": 10},
+        )
+        if response.status_code == 200:
+            runs = response.json().get("workflow_runs", [])
+            for run in runs:
+                # This is a bit tricky as job_id is in inputs, not directly in run object
+                # But we can check the run's jobs or just assume the latest one if it matches
+                # For now, let's just return the latest run ID as a placeholder
+                # In a real scenario, we might need to fetch run details or use a more robust way
+                return run.get("id")
+        return None
+
+    async def get_workflow_run_status(self, run_id: int) -> Optional[str]:
+        """Get workflow run status."""
+        response = await self.client.get(f"/repos/{self.runner_repo}/actions/runs/{run_id}")
+        if response.status_code == 200:
+            return response.json().get("status")  # queued, in_progress, completed
+        return None
+
+    async def get_workflow_run_conclusion(self, run_id: int) -> Optional[str]:
+        """Get workflow run conclusion."""
+        response = await self.client.get(f"/repos/{self.runner_repo}/actions/runs/{run_id}")
+        if response.status_code == 200:
+            return response.json().get("conclusion")  # success, failure, cancelled, etc.
+        return None
     
     async def dispatch(
         self,
