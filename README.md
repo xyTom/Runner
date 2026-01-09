@@ -74,6 +74,9 @@ curl -X POST \
 If you prefer an HTTP API interface:
 
 ```bash
+# Install OpenHands SDK (requires Python 3.12+)
+pip install -e '.[openhands]'
+
 # Install with server extras
 pip install -e '.[server]'
 

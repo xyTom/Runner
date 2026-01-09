@@ -9,6 +9,6 @@ pydantic>=2.9.0
 # fastapi>=0.115.0
 # uvicorn>=0.32.0
 
-# OpenHands SDK (installed separately in CI)
+# OpenHands SDK (requires Python 3.12+; installed separately in CI)
 # openhands-sdk
 # openhands-tools
